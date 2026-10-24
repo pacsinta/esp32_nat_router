@@ -39,8 +39,15 @@
 #if !CONFIG_ETH_UPLINK
 #include "esp_eap_client.h"
 #endif
-#if CONFIG_ETH_UPLINK
+#if CONFIG_ETH_UPLINK || CONFIG_ETH_DOWNLINK_W5500
 #include "esp_eth.h"
+#include "esp_mac.h"
+#endif
+#if CONFIG_ETH_DOWNLINK_W5500
+#include "driver/spi_master.h"
+#include "esp_eth_mac_w5500.h"
+#include "esp_eth_phy.h"
+#include "esp_eth_phy_w5500.h"
 #endif
 
 #include "lwip/opt.h"
@@ -171,7 +178,11 @@ uint16_t connect_count = 0;
 bool ap_connect = false;
 bool wifi_scan_active = false;
 bool has_static_ip = false;
+#if CONFIG_ETH_DOWNLINK_W5500 && defined(CONFIG_IDF_TARGET_ESP32)
+int led_gpio = 2;   // ESP32-WROOM onboard LED
+#else
 int led_gpio = -1;  // -1 means LED disabled (none)
+#endif
 uint8_t led_lowactive = 0;  // 0 = active-high (default), 1 = active-low (inverted)
 uint8_t led_toggle = 0;  // Shared toggle state for packet-driven LED flicker
 
@@ -188,10 +199,11 @@ struct dhcp_reservation_entry dhcp_reservations[MAX_DHCP_RESERVATIONS];
 esp_netif_t* wifiAP;
 bool ap_disabled = false;
 uint8_t ap_nat_enabled = 1;
-#if CONFIG_ETH_UPLINK
+#if CONFIG_ETH_UPLINK || CONFIG_ETH_DOWNLINK_W5500
 esp_netif_t* ethNetif = NULL;
 esp_eth_handle_t eth_handle = NULL;
-#else
+#endif
+#if !CONFIG_ETH_UPLINK
 esp_netif_t* wifiSTA;
 #endif
 
@@ -354,14 +366,15 @@ void * led_status_thread(void * p)
 
     while (true)
     {
-        // --- LED status: OFF=disconnected, ON=connected (packet hooks flicker it off) ---
-        if (led_enabled && held_ms == 0) {
-            gpio_set_level(led_gpio, ap_connect ^ led_lowactive);
-        }
-
         // --- Poll interval with button polling ---
         for (int t = 0; t < 1000 / POLL_INTERVAL_MS; t++) {
             vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+
+            // Fast blink while disconnected, off when Wi-Fi is connected.
+            if (led_enabled && held_ms == 0) {
+                bool led_on = !ap_connect && ((esp_log_timestamp() / 250) & 1);
+                gpio_set_level(led_gpio, led_on ^ led_lowactive);
+            }
 
             // Update addressable LED strip colour each tick
             if (strip_active) {
@@ -416,7 +429,7 @@ void * led_status_thread(void * p)
 
 /* Event handlers */
 
-#if CONFIG_ETH_UPLINK
+#if CONFIG_ETH_UPLINK || CONFIG_ETH_DOWNLINK_W5500
 static void eth_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
@@ -433,7 +446,9 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base,
         } else if (event_id == ETHERNET_EVENT_START) {
             ESP_LOGI(TAG, "Ethernet started");
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+    }
+#if CONFIG_ETH_UPLINK
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "ETH got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         ap_connect = true;
@@ -469,8 +484,12 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base,
         }
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
+#endif
 }
 
+#endif
+
+#if CONFIG_ETH_UPLINK
 static void wifi_ap_event_handler(void* arg, esp_event_base_t event_base,
                                    int32_t event_id, void* event_data)
 {
@@ -817,7 +836,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
 void ap_set_enabled(bool enabled)
 {
-#if CONFIG_ETH_UPLINK
+#if CONFIG_ETH_DOWNLINK_W5500
+    (void)enabled;
+    ap_disabled = true;
+    set_config_param_int("ap_disabled", 1);
+    ESP_LOGI(TAG, "SoftAP is unavailable in W5500 Ethernet LAN mode");
+    return;
+#elif CONFIG_ETH_UPLINK
     if (enabled) {
         esp_wifi_start();
         if (ap_nat_enabled) {
@@ -844,9 +869,11 @@ void ap_set_enabled(bool enabled)
         esp_wifi_set_mode(WIFI_MODE_STA);
     }
 #endif
+#if !CONFIG_ETH_DOWNLINK_W5500
     ap_disabled = !enabled;
     set_config_param_int("ap_disabled", ap_disabled ? 1 : 0);
     ESP_LOGI(TAG, "AP interface %s", enabled ? "enabled" : "disabled");
+#endif
 }
 
 static wifi_auth_mode_t get_ap_authmode(void)
@@ -857,6 +884,92 @@ static wifi_auth_mode_t get_ap_authmode(void)
         default: return WIFI_AUTH_WPA2_WPA3_PSK;
     }
 }
+
+#if CONFIG_ETH_DOWNLINK_W5500
+static void eth_downlink_init(const char* ap_ip)
+{
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = CONFIG_ETH_SPI_MOSI_GPIO,
+        .miso_io_num = CONFIG_ETH_SPI_MISO_GPIO,
+        .sclk_io_num = CONFIG_ETH_SPI_SCLK_GPIO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(CONFIG_ETH_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
+
+    spi_device_interface_config_t device_config = {
+        .command_bits = 16,
+        .address_bits = 8,
+        .mode = 0,
+        .clock_speed_hz = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
+        .spics_io_num = CONFIG_ETH_SPI_CS_GPIO,
+        .queue_size = 4,
+    };
+    eth_w5500_config_t w5500_config =
+        ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &device_config);
+    w5500_config.base.int_gpio_num = CONFIG_ETH_SPI_INT_GPIO;
+#if CONFIG_ETH_SPI_INT_GPIO < 0
+    w5500_config.base.poll_period_ms = CONFIG_ETH_SPI_POLL_MS;
+#endif
+
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+    ESP_ERROR_CHECK(mac ? ESP_OK : ESP_ERR_NO_MEM);
+
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+    phy_config.reset_gpio_num = CONFIG_ETH_SPI_RST_GPIO;
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
+    ESP_ERROR_CHECK(phy ? ESP_OK : ESP_ERR_NO_MEM);
+
+    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
+
+    uint8_t eth_mac_addr[6];
+    ESP_ERROR_CHECK(esp_read_mac(eth_mac_addr, ESP_MAC_ETH));
+    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, eth_mac_addr));
+
+    esp_netif_ip_info_t eth_ip_info = { 0 };
+    my_ap_ip = esp_ip4addr_aton(ap_ip);
+    eth_ip_info.ip.addr = my_ap_ip;
+    eth_ip_info.gw.addr = my_ap_ip;
+    esp_netif_set_ip4_addr(&eth_ip_info.netmask, 255, 255, 255, 0);
+
+    esp_netif_inherent_config_t eth_base_config = ESP_NETIF_INHERENT_DEFAULT_ETH();
+    eth_base_config.flags = (esp_netif_flags_t)((eth_base_config.flags &
+        ~(ESP_NETIF_DHCP_CLIENT | ESP_NETIF_DHCP_SERVER)) |
+        ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP);
+    eth_base_config.ip_info = &eth_ip_info;
+    eth_base_config.route_prio = 10;
+
+    esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_ETH();
+    netif_config.base = &eth_base_config;
+    ethNetif = esp_netif_new(&netif_config);
+    ESP_ERROR_CHECK(ethNetif ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(esp_netif_attach(ethNetif, esp_eth_new_netif_glue(eth_handle)));
+    esp_netif_set_hostname(ethNetif, hostname);
+
+    dhcps_offer_t dns_offer = OFFER_DNS;
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(ethNetif, ESP_NETIF_OP_SET,
+        ESP_NETIF_DOMAIN_NAME_SERVER, &dns_offer, sizeof(dns_offer)));
+    esp_netif_dns_info_t dns = { 0 };
+    const char *dns_source = effective_ap_dns();
+    dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns_source ? dns_source : DEFAULT_DNS);
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+        &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
+        &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+    ESP_LOGI(TAG, "W5500 Ethernet LAN initialized on SPI%d", CONFIG_ETH_SPI_HOST + 1);
+}
+#endif
 
 #if CONFIG_ETH_UPLINK
 void eth_init(const char* static_ip, const char* subnet_mask, const char* gateway_addr,
@@ -966,9 +1079,9 @@ void eth_init(const char* static_ip, const char* subnet_mask, const char* gatewa
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     if (ap_mac != NULL) {
-        ESP_ERROR_CHECK(esp_wifi_set_mac(ESP_IF_WIFI_AP, ap_mac));
+        ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, ap_mac));
     }
 
     // Enable DNS (offer) for dhcp server
@@ -1001,7 +1114,12 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
 
     esp_netif_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+#if CONFIG_ETH_DOWNLINK_W5500
+    eth_downlink_init(ap_ip);
+    wifiAP = ethNetif;
+#else
     wifiAP = esp_netif_create_default_wifi_ap();
+#endif
     wifiSTA = esp_netif_create_default_wifi_sta();
 
     // Set DHCP client hostname (Option 12)
@@ -1026,8 +1144,8 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
         ESP_LOGI(TAG, "Static IP: DNS set to %s", dns_src);
     }
 
+#if !CONFIG_ETH_DOWNLINK_W5500
     my_ap_ip = esp_ip4addr_aton(ap_ip);
-
     esp_netif_ip_info_t ipInfo_ap;
     ipInfo_ap.ip.addr = my_ap_ip;
     ipInfo_ap.gw.addr = my_ap_ip;
@@ -1035,6 +1153,7 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
     esp_netif_dhcps_stop(wifiAP); // stop before setting ip WifiAP
     esp_netif_set_ip_info(wifiAP, &ipInfo_ap);
     esp_netif_dhcps_start(wifiAP);
+#endif
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
@@ -1054,6 +1173,7 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
 
     /* ESP WIFI CONFIG */
     wifi_config_t wifi_config = { 0 };
+#if !CONFIG_ETH_DOWNLINK_W5500
         wifi_config_t ap_config = {
         .ap = {
             .channel = 0,
@@ -1070,9 +1190,14 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
     } else {
 	    strlcpy((char*)ap_config.sta.password, ap_passwd, sizeof(ap_config.sta.password));
     }
+#endif
 
     // Always use APSTA mode so WiFi scanning works even without an uplink configured
+#if CONFIG_ETH_DOWNLINK_W5500
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+#else
     ESP_ERROR_CHECK(esp_wifi_set_mode(ap_disabled ? WIFI_MODE_STA : WIFI_MODE_APSTA));
+#endif
 
     if (strlen(ssid) > 0) {
         //Set SSID
@@ -1082,7 +1207,7 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
             ESP_LOGI(TAG, "STA regular connection");
             strlcpy((char*)wifi_config.sta.password, passwd, sizeof(wifi_config.sta.password));
         }
-        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
         if(strlen(ent_username) != 0) {
             ESP_LOGI(TAG, "STA enterprise connection");
             if(strlen(ent_identity) != 0) {
@@ -1114,17 +1239,20 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
         }
 
         if (mac != NULL) {
-            ESP_ERROR_CHECK(esp_wifi_set_mac(ESP_IF_WIFI_STA, mac));
+            ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, mac));
         }
     }
 
     if (!ap_disabled) {
-        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
+#if !CONFIG_ETH_DOWNLINK_W5500
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         if (ap_mac != NULL) {
-            ESP_ERROR_CHECK(esp_wifi_set_mac(ESP_IF_WIFI_AP, ap_mac));
+            ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, ap_mac));
         }
+#endif
     }
 
+#if !CONFIG_ETH_DOWNLINK_W5500
 
     // Enable DNS (offer) for dhcp server
     dhcps_offer_t dhcps_dns_value = OFFER_DNS;
@@ -1142,11 +1270,15 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
     }
     dnsserver.ip.type = ESP_IPADDR_TYPE_V4;
     esp_netif_set_dns_info(wifiAP, ESP_NETIF_DNS_MAIN, &dnsserver);
+#endif
 
-    // esp_netif_get_dns_info(ESP_IF_WIFI_AP, ESP_NETIF_DNS_MAIN, &dnsinfo);
+    // esp_netif_get_dns_info(WIFI_IF_AP, ESP_NETIF_DNS_MAIN, &dnsinfo);
     // ESP_LOGI(TAG, "DNS IP:" IPSTR, IP2STR(&dnsinfo.ip.u_addr.ip4));
 
     ESP_ERROR_CHECK(esp_wifi_start());
+#if CONFIG_ETH_DOWNLINK_W5500
+    esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
 
     if (strlen(ssid) > 0) {
         ESP_LOGI(TAG, "wifi_init_apsta finished.");
@@ -1646,18 +1778,16 @@ void app_main(void)
     pthread_t t1;
     pthread_create(&t1, NULL, led_status_thread, NULL);
 
-    if (!ap_disabled) {
-        if (ap_nat_enabled) {
-            ip_napt_enable(my_ap_ip, 1);
-            /* The uplink may have got its IP before NAPT allocated its
-             * tables, in which case the GOT_IP portmap restore was a no-op.
-             * Delete first: ip_portmap_add() would duplicate existing entries. */
-            delete_portmap_tab();
-            apply_portmap_tab();
-            ESP_LOGI(TAG, "NAT is enabled");
-        } else {
-            ESP_LOGI(TAG, "NAT is disabled (routed mode)");
-        }
+    if (ap_nat_enabled) {
+        ip_napt_enable(my_ap_ip, 1);
+        /* The uplink may have got its IP before NAPT allocated its
+         * tables, in which case the GOT_IP portmap restore was a no-op.
+         * Delete first: ip_portmap_add() would duplicate existing entries. */
+        delete_portmap_tab();
+        apply_portmap_tab();
+        ESP_LOGI(TAG, "NAT is enabled");
+    } else {
+        ESP_LOGI(TAG, "NAT is disabled (routed mode)");
     }
 
     char* web_disabled = NULL;

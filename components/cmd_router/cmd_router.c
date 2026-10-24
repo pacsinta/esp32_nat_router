@@ -34,7 +34,7 @@
 #endif
 #include "lwip/lwip_napt.h"
 
-#include "mbedtls/sha256.h"
+#include "psa/crypto.h"
 #include "esp_random.h"
 
 #include "driver/gpio.h"
@@ -1185,16 +1185,34 @@ static int pw_hex_to_bytes(const char *src, uint8_t *dst, size_t len)
     return 0;
 }
 
-static void pw_compute_hash(const uint8_t *salt, size_t salt_len,
+static bool pw_compute_hash(const uint8_t *salt, size_t salt_len,
                             const char *plaintext, uint8_t *hash_out)
 {
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);  /* 0 = SHA-256 (not 224) */
-    mbedtls_sha256_update(&ctx, salt, salt_len);
-    mbedtls_sha256_update(&ctx, (const uint8_t *)plaintext, strlen(plaintext));
-    mbedtls_sha256_finish(&ctx, hash_out);
-    mbedtls_sha256_free(&ctx);
+    psa_hash_operation_t operation = PSA_HASH_OPERATION_INIT;
+    size_t hash_len;
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "PSA crypto initialization failed: %d", (int)status);
+        return false;
+    }
+
+    status = psa_hash_setup(&operation, PSA_ALG_SHA_256);
+    if (status == PSA_SUCCESS) {
+        status = psa_hash_update(&operation, salt, salt_len);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_hash_update(&operation, (const uint8_t *)plaintext, strlen(plaintext));
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_hash_finish(&operation, hash_out, PSA_HASH_LENGTH(PSA_ALG_SHA_256), &hash_len);
+    } else {
+        psa_hash_abort(&operation);
+    }
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Password hash failed: %d", (int)status);
+        return false;
+    }
+    return hash_len == PSA_HASH_LENGTH(PSA_ALG_SHA_256);
 }
 
 bool is_web_password_set(void)
@@ -1233,7 +1251,10 @@ bool verify_web_password(const char *plaintext)
             free(stored);
             return false;
         }
-        pw_compute_hash(salt, PW_SALT_LEN, plaintext, computed_hash);
+        if (!pw_compute_hash(salt, PW_SALT_LEN, plaintext, computed_hash)) {
+            free(stored);
+            return false;
+        }
         free(stored);
 
         /* Constant-time comparison */
@@ -1263,7 +1284,9 @@ esp_err_t set_web_password_hashed(const char *plaintext)
 
     uint8_t salt[PW_SALT_LEN], hash[PW_HASH_LEN];
     esp_fill_random(salt, PW_SALT_LEN);
-    pw_compute_hash(salt, PW_SALT_LEN, plaintext, hash);
+    if (!pw_compute_hash(salt, PW_SALT_LEN, plaintext, hash)) {
+        return ESP_FAIL;
+    }
 
     /* Format: "salt_hex:hash_hex" */
     char buf[PW_SALT_LEN * 2 + 1 + PW_HASH_LEN * 2 + 1];

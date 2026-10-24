@@ -48,9 +48,7 @@
 #include "esp_app_format.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
-#include "mbedtls/pkcs5.h"
-#include "mbedtls/md.h"
-#include "mbedtls/base64.h"
+#include "psa/crypto.h"
 
 static const char *TAG = "HTTPServer";
 
@@ -460,13 +458,105 @@ static int hex_to_bytes(const char *src, uint8_t *dst, size_t len)
 }
 
 /* Derive a 32-byte key from passphrase + salt using PBKDF2-HMAC-SHA256. */
-static void config_derive_key(const char *pass, const uint8_t *salt, uint8_t key[ENC_KEY_LEN])
+static bool config_derive_key(const char *pass, const uint8_t *salt, uint8_t key[ENC_KEY_LEN])
 {
-    mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
-                                  (const uint8_t *)pass, strlen(pass),
-                                  salt, ENC_SALT_LEN,
-                                  ENC_PBKDF2_ITER,
-                                  ENC_KEY_LEN, key);
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_status_t status = psa_crypto_init();
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_setup(&operation, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_integer(&operation,
+                                                   PSA_KEY_DERIVATION_INPUT_COST,
+                                                   ENC_PBKDF2_ITER);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_bytes(&operation,
+                                                 PSA_KEY_DERIVATION_INPUT_SALT,
+                                                 salt, ENC_SALT_LEN);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_bytes(&operation,
+                                                 PSA_KEY_DERIVATION_INPUT_PASSWORD,
+                                                 (const uint8_t *)pass, strlen(pass));
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_output_bytes(&operation, key, ENC_KEY_LEN);
+    }
+    psa_key_derivation_abort(&operation);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Config key derivation failed: %d", (int)status);
+        return false;
+    }
+    return true;
+}
+
+static const char config_base64_alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static size_t config_base64_encoded_size(size_t input_len)
+{
+    return ((input_len + 2) / 3) * 4 + 1;
+}
+
+static size_t config_base64_encode(char *out, size_t out_len,
+                                   const uint8_t *input, size_t input_len)
+{
+    size_t encoded_len = config_base64_encoded_size(input_len) - 1;
+    if (out_len < encoded_len + 1) return 0;
+
+    size_t i = 0, o = 0;
+    while (i < input_len) {
+        uint32_t block = (uint32_t)input[i++] << 16;
+        bool have_second = i < input_len;
+        if (have_second) block |= (uint32_t)input[i++] << 8;
+        bool have_third = i < input_len;
+        if (have_third) block |= input[i++];
+        out[o++] = config_base64_alphabet[(block >> 18) & 0x3f];
+        out[o++] = config_base64_alphabet[(block >> 12) & 0x3f];
+        out[o++] = have_second ? config_base64_alphabet[(block >> 6) & 0x3f] : '=';
+        out[o++] = have_third ? config_base64_alphabet[block & 0x3f] : '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+
+static int config_base64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t config_base64_decode(uint8_t *out, size_t out_len, const char *input)
+{
+    size_t input_len = strlen(input);
+    if (input_len == 0 || input_len % 4 != 0) return 0;
+    size_t decoded_len = input_len / 4 * 3;
+    if (input[input_len - 1] == '=') decoded_len--;
+    if (input[input_len - 2] == '=') decoded_len--;
+    if (out_len < decoded_len) return 0;
+
+    size_t o = 0;
+    for (size_t i = 0; i < input_len; i += 4) {
+        int a = config_base64_value(input[i]);
+        int b = config_base64_value(input[i + 1]);
+        int c = input[i + 2] == '=' ? 0 : config_base64_value(input[i + 2]);
+        int d = input[i + 3] == '=' ? 0 : config_base64_value(input[i + 3]);
+        bool final_group = i + 4 == input_len;
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (!final_group && (input[i + 2] == '=' || input[i + 3] == '=')) ||
+            (input[i + 2] == '=' && input[i + 3] != '=')) {
+            return 0;
+        }
+        if (o < decoded_len) out[o++] = (uint8_t)((a << 2) | (b >> 4));
+        if (input[i + 2] != '=' && o < decoded_len) out[o++] = (uint8_t)((b << 4) | (c >> 2));
+        if (input[i + 3] != '=' && o < decoded_len) out[o++] = (uint8_t)((c << 6) | d);
+    }
+    return o == decoded_len ? decoded_len : 0;
 }
 
 /*
@@ -483,7 +573,10 @@ static char *config_encrypt_json(char *plain, size_t plain_len, const char *pass
     uint8_t salt[ENC_SALT_LEN], nonce[ENC_NONCE_LEN], key[ENC_KEY_LEN];
     esp_fill_random(salt, sizeof(salt));
     esp_fill_random(nonce, sizeof(nonce));
-    config_derive_key(pass, salt, key);
+    if (!config_derive_key(pass, salt, key)) {
+        free(plain);
+        return NULL;
+    }
 
     size_t cipher_len = plain_len + ENC_TAG_LEN;
     uint8_t *cipher = malloc(cipher_len);
@@ -501,9 +594,7 @@ static char *config_encrypt_json(char *plain, size_t plain_len, const char *pass
     nonce_hex[ENC_NONCE_LEN * 2] = '\0';
 
     /* Query base64 output size (b64_needed includes trailing NUL) */
-    size_t b64_needed = 0;
-    mbedtls_base64_encode(NULL, 0, &b64_needed, cipher, cipher_len);
-    size_t b64_str_len = b64_needed > 0 ? b64_needed - 1 : 0;
+    size_t b64_str_len = config_base64_encoded_size(cipher_len) - 1;
 
     /* Build JSON prefix and suffix so we can base64-encode directly into
      * the output buffer, avoiding a separate b64 allocation. */
@@ -520,10 +611,13 @@ static char *config_encrypt_json(char *plain, size_t plain_len, const char *pass
              salt_hex, nonce_hex);
 
     /* Base64-encode ciphertext directly into the output buffer */
-    size_t b64_written = 0;
-    mbedtls_base64_encode((unsigned char *)(out + pre_len),
-                          out_len - pre_len, &b64_written,
-                          cipher, cipher_len);
+    size_t b64_written = config_base64_encode(out + pre_len, out_len - pre_len,
+                                              cipher, cipher_len);
+    if (b64_written == 0) {
+        free(cipher);
+        free(out);
+        return NULL;
+    }
     free(cipher);
 
     /* Close the JSON envelope (overwrite the base64 NUL terminator) */
@@ -556,19 +650,24 @@ static char *config_decrypt_json(const char *enc_json, const char *pass)
 
     /* Base64-decode ciphertext */
     size_t b64_in_len = strlen(c_item->valuestring);
-    size_t cipher_len = 0;
-    mbedtls_base64_decode(NULL, 0, &cipher_len,
-                          (const unsigned char *)c_item->valuestring, b64_in_len);
+    size_t cipher_len = b64_in_len / 4 * 3;
+    if (b64_in_len == 0 || b64_in_len % 4 != 0) {
+        cJSON_Delete(j);
+        return NULL;
+    }
+    if (c_item->valuestring[b64_in_len - 1] == '=') cipher_len--;
+    if (c_item->valuestring[b64_in_len - 2] == '=') cipher_len--;
     uint8_t *cipher = malloc(cipher_len);
     if (!cipher) { cJSON_Delete(j); return NULL; }
-    size_t actual_cipher_len = 0;
-    int rc = mbedtls_base64_decode(cipher, cipher_len, &actual_cipher_len,
-                                   (const unsigned char *)c_item->valuestring, b64_in_len);
+    size_t actual_cipher_len = config_base64_decode(cipher, cipher_len, c_item->valuestring);
     cJSON_Delete(j);
-    if (rc != 0 || actual_cipher_len < ENC_TAG_LEN) { free(cipher); return NULL; }
+    if (actual_cipher_len < ENC_TAG_LEN) { free(cipher); return NULL; }
 
     uint8_t key[ENC_KEY_LEN];
-    config_derive_key(pass, salt, key);
+    if (!config_derive_key(pass, salt, key)) {
+        free(cipher);
+        return NULL;
+    }
 
     size_t plain_len = actual_cipher_len - ENC_TAG_LEN;
     uint8_t *plain = malloc(plain_len + 1);
@@ -2076,13 +2175,13 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     // Get MAC addresses as strings
     char ap_mac_str[18] = "";
     uint8_t mac[6];
-    if (esp_wifi_get_mac(ESP_IF_WIFI_AP, mac) == ESP_OK) {
+    if (esp_wifi_get_mac(WIFI_IF_AP, mac) == ESP_OK) {
         sprintf(ap_mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 #if !CONFIG_ETH_UPLINK
     char sta_mac_str[18] = "";
-    if (esp_wifi_get_mac(ESP_IF_WIFI_STA, mac) == ESP_OK) {
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
         sprintf(sta_mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }

@@ -19,7 +19,56 @@ menu "NAT Router Uplink"
             bool "WiFi STA"
         config ETH_UPLINK
             bool "Ethernet (LAN8720)"
+        config ETH_DOWNLINK_W5500
+            bool "WiFi STA + Ethernet LAN (W5500)"
     endchoice
+
+    config ETH_SPI_HOST
+        int "W5500 SPI host number (1=SPI2_HOST, 2=SPI3_HOST)"
+        default 1
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_MISO_GPIO
+        int "W5500 MISO GPIO"
+        default 19
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_MOSI_GPIO
+        int "W5500 MOSI GPIO"
+        default 23
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_SCLK_GPIO
+        int "W5500 SCLK GPIO"
+        default 18
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_CS_GPIO
+        int "W5500 SCS GPIO"
+        default 5
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_INT_GPIO
+        int "W5500 INT GPIO (-1 for polling)"
+        default -1
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_RST_GPIO
+        int "W5500 RST GPIO (-1 to disable)"
+        default 16
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_POLL_MS
+        int "W5500 polling period (ms)"
+        default 2
+        range 1 100
+        depends on ETH_DOWNLINK_W5500
+
+    config ETH_SPI_CLOCK_MHZ
+        int "W5500 SPI clock (MHz)"
+        default 10
+        range 1 80
+        depends on ETH_DOWNLINK_W5500
 
     config ETH_MDC_GPIO
         int "ETH MDC GPIO"

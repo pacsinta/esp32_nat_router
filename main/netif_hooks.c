@@ -163,10 +163,6 @@ static IRAM_ATTR err_t netif_input_hook(struct pbuf *p, struct netif *netif) {
     // Count received bytes and toggle LED
     if (netif == sta_netif && p != NULL) {
         sta_bytes_received += p->tot_len;
-        if (led_gpio >= 0 && ap_connect) {
-            led_toggle ^= 1;
-            gpio_set_level(led_gpio, led_toggle ^ led_lowactive);
-        }
         if (led_strip_gpio >= 0) {
             led_strip_notify_traffic();
         }
@@ -240,10 +236,6 @@ static IRAM_ATTR err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p
     // Count sent bytes and toggle LED
     if (netif == sta_netif && p != NULL) {
         sta_bytes_sent += p->tot_len;
-        if (led_gpio >= 0 && ap_connect) {
-            led_toggle ^= 1;
-            gpio_set_level(led_gpio, led_toggle ^ led_lowactive);
-        }
         if (led_strip_gpio >= 0) {
             led_strip_notify_traffic();
         }
