@@ -32,6 +32,7 @@ Starting from this code base I started several spin-off projects with slightly d
 - **WPA2-Enterprise Support**: Connect to corporate networks (PEAP, TTLS, TLS) and convert them to WPA2-PSK
 - **5 GHz WiFi**: Dual-band support on ESP32-C5 with configurable band preference (auto/2.4 GHz/5 GHz)
 - **Ethernet Support**: Use a W32-ET01 board with LAN8720 PHY to get Ethernet uplink
+- **W5500 Ethernet LAN**: Use an ESP32-WROOM-32 with a W5500 as a wired LAN behind a Wi-Fi STA uplink
 - **Web Interface**: Web UI with password protection for easy configuration
 - **Serial Console**: Full CLI for advanced configuration
 - **Remote Console**: Network-accessible CLI via TCP (password protected, per-interface binding)
@@ -114,6 +115,36 @@ idf.py flash monitor
 ```
 
 See the [Building](https://github.com/martin-ger/esp32_nat_router/wiki/Building) wiki page for PlatformIO, WT32-ETH01, and multi-target build instructions.
+
+### Wi-Fi upstream to W5500 Ethernet LAN
+
+The `esp32-w5500` PlatformIO environment configures the ESP32-WROOM-32 as a Wi-Fi
+station uplink and the W5500 as a routed Ethernet LAN. Ethernet clients receive
+DHCP addresses in `192.168.4.0/24`, with the ESP32 at `192.168.4.1`; IPv4 NAPT
+provides Internet access through the configured Wi-Fi network. This is a Layer-3
+NAT router, not a transparent Layer-2 bridge.
+
+Default W5500 wiring:
+
+| W5500 | ESP32-WROOM-32 |
+|---|---|
+| SCLK | GPIO18 |
+| MISO | GPIO19 |
+| MOSI | GPIO23 |
+| SCS | GPIO5 |
+| RST | GPIO16 |
+| INT | Not connected (polling) |
+| 3.3V | 3V3 |
+| GND | GND |
+
+Build it with `pio run -e esp32-w5500`, flash it, then configure the upstream
+Wi-Fi credentials through the serial console (`set_sta <ssid> <password>`) or
+the web configuration. This variant uses Wi-Fi in **STA mode only** and never
+starts the ESP32 SoftAP. Connect a wired client to the W5500 and use DHCP;
+NAT remains enabled for the Ethernet LAN even with the SoftAP disabled.
+
+If the W5500 module has its own 3.3 V regulator, do not connect its 3.3 V pin
+to the ESP32 3V3 pin; follow the module's power requirements.
 
 ## Performance
 

@@ -6,3 +6,4 @@ dependencies:
     version: '*'
     rules:
       - if: "idf_target != \"esp32c5\""
+  espressif/w5500: '*'

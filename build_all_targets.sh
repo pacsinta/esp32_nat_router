@@ -6,11 +6,12 @@
 set -e  # Exit on any error
 
 # Build targets in order
-BUILD_ORDER=("esp32" "wt32_eth01" "esp32_poe_iso" "esp32s3" "esp32c5" "esp32c6" "esp32c3")
+BUILD_ORDER=("esp32" "esp32_w5500" "wt32_eth01" "esp32_poe_iso" "esp32s3" "esp32c5" "esp32c6" "esp32c3")
 
 # Target descriptions
 declare -A TARGET_DESC=(
     ["esp32"]="ESP32 (Original)"
+    ["esp32_w5500"]="ESP32-WROOM-32 + W5500 (WiFi uplink)"
     ["esp32s3"]="ESP32-S3"
     ["esp32c6"]="ESP32-C6"
     ["esp32c3"]="ESP32-C3"
@@ -22,6 +23,7 @@ declare -A TARGET_DESC=(
 # IDF chip target for each build target
 declare -A TARGET_CHIP=(
     ["esp32"]="esp32"
+    ["esp32_w5500"]="esp32"
     ["esp32s3"]="esp32s3"
     ["esp32c6"]="esp32c6"
     ["esp32c3"]="esp32c3"
@@ -37,6 +39,7 @@ declare -A TARGET_CHIP=(
 # their files listed explicitly; the chip entries are spelled out for clarity.
 declare -A TARGET_SDKCONFIG=(
     ["esp32"]="sdkconfig.defaults"
+    ["esp32_w5500"]="sdkconfig.defaults;sdkconfig.defaults.w5500"
     ["esp32s3"]="sdkconfig.defaults;sdkconfig.defaults.esp32s3"
     ["esp32c6"]="sdkconfig.defaults;sdkconfig.defaults.esp32c6"
     ["esp32c3"]="sdkconfig.defaults;sdkconfig.defaults.esp32c3"
@@ -49,6 +52,7 @@ declare -A TARGET_SDKCONFIG=(
 # target can never leak into the next one.
 declare -A TARGET_BUILD_DIR=(
     ["esp32"]="build_esp32"
+    ["esp32_w5500"]="build_w5500"
     ["esp32s3"]="build_esp32s3"
     ["esp32c6"]="build_esp32c6"
     ["esp32c3"]="build_esp32c3"
@@ -59,6 +63,7 @@ declare -A TARGET_BUILD_DIR=(
 
 declare -A TARGET_SDKCONFIG_FILE=(
     ["esp32"]="sdkconfig.esp32"
+    ["esp32_w5500"]="sdkconfig.w5500"
     ["esp32s3"]="sdkconfig.esp32s3"
     ["esp32c6"]="sdkconfig.esp32c6"
     ["esp32c3"]="sdkconfig.esp32c3"
