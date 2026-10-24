@@ -1,5 +1,12 @@
 # ESP32 NAT Router
 
+> **Fork changes:** Compared with the original `martin-ger/esp32_nat_router`
+> branch, this fork adds improved firmware crypto and networking support,
+> including W5500 Ethernet LAN support and related build configurations. It
+> also includes the `configurator/` Python desktop serial configurator for
+> Wi-Fi provisioning, live serial monitoring, and sending the `restart` COM
+> command. See the commit history for the complete list of changes.
+
 This is a firmware to use the ESP32 as WiFi NAT router. It routes between the network of the AP interface and the STA or ETH interface as uplink network. It can also work as a VPN router using WireGuard as uplink.
 
 ## Other WiFi Router/Repeater Projects
